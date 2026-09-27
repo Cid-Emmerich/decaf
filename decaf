@@ -1,0 +1,317 @@
+#!/bin/bash
+# decaf: times your Mac's charge to a target %, with a live view and graphs.
+# https://github.com/Cid-Emmerich/decaf (MIT License)
+#
+# Written for the Bash 3.2 that ships with macOS, so no associative arrays,
+# mapfile or ${var,,}.
+
+VERSION="1.0.0"
+
+target=100
+interval=30
+outdir="${DECAF_DIR:-$HOME/Documents/Decaf}"
+open_report=1
+notify=1
+quiet=0
+report_csv=""
+
+usage() {
+  cat <<EOF
+decaf $VERSION: time your Mac's charge and graph it.
+
+Usage:
+  decaf [options]             watch the charge until it reaches the target
+  decaf --report FILE.csv     rebuild the graphs from an earlier log
+
+Options:
+  -t, --to PCT        stop at this battery % (default 100)
+  -i, --interval SEC  seconds between samples (default 30)
+  -o, --out DIR       where logs and reports go (default ~/Documents/Decaf,
+                      or \$DECAF_DIR)
+      --no-open       don't open the HTML report in the browser
+      --no-notify     don't show a notification when done
+  -q, --quiet         no live view, just the final summary
+  -h, --help          show this help
+  -v, --version       show the version
+
+Press Ctrl+C at any time to stop early and still get the report.
+decaf keeps your Mac awake (via caffeinate) while it runs.
+EOF
+}
+
+die() { echo "decaf: $*" >&2; exit 1; }
+
+is_int() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t|--to)       [ $# -ge 2 ] || die "$1 needs a value"; target=$2; shift ;;
+    --to=*)        target=${1#*=} ;;
+    -i|--interval) [ $# -ge 2 ] || die "$1 needs a value"; interval=$2; shift ;;
+    --interval=*)  interval=${1#*=} ;;
+    -o|--out)      [ $# -ge 2 ] || die "$1 needs a value"; outdir=$2; shift ;;
+    --out=*)       outdir=${1#*=} ;;
+    --report)      [ $# -ge 2 ] || die "$1 needs a CSV file"; report_csv=$2; shift ;;
+    --report=*)    report_csv=${1#*=} ;;
+    --no-open)     open_report=0 ;;
+    --no-notify)   notify=0 ;;
+    -q|--quiet)    quiet=1 ;;
+    -h|--help)     usage; exit 0 ;;
+    -v|--version)  echo "decaf $VERSION"; exit 0 ;;
+    *)             die "unknown option '$1' (try decaf --help)" ;;
+  esac
+  shift
+done
+
+is_int "$target" && [ "$target" -ge 1 ] && [ "$target" -le 100 ] ||
+  die "--to must be a whole number from 1 to 100"
+is_int "$interval" && [ "$interval" -ge 1 ] ||
+  die "--interval must be a whole number of seconds (1 or more)"
+
+# Colors only when writing to a terminal.
+if [ -t 1 ]; then
+  tty=1; B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
+else
+  tty=0; B=""; D=""; R=""
+fi
+
+fmt_dur() {
+  local s=$1
+  if [ "$s" -ge 3600 ]; then printf '%dh %dm %ds' $((s/3600)) $((s%3600/60)) $((s%60))
+  elif [ "$s" -ge 60 ]; then printf '%dm %ds' $((s/60)) $((s%60))
+  else printf '%ds' "$s"; fi
+}
+
+# Draws the three graphs in the terminal from a decaf CSV (min,pct,watts,tempC).
+term_graphs() {
+  awk -F, -v color="$tty" '
+    BEGIN { n = 0 }
+    NR > 1 && NF >= 4 { m[n] = $1; y1[n] = $2; y2[n] = $3; y3[n] = $4; n++ }
+    function chart(title, y, zero, c,   W, H, i, j, col, lo, hi, d, row, line, lab) {
+      W = 60; H = 6
+      lo = y[0]; hi = y[0]
+      for (i = 0; i < n; i++) { if (y[i] < lo) lo = y[i]; if (y[i] > hi) hi = y[i] }
+      if (zero) lo = 0
+      if (hi - lo < 1e-9) hi = lo + 1
+      for (j = 0; j < W; j++) {
+        i = int(j * (n - 1) / (W - 1) + 0.5)
+        col[j] = int((y[i] - lo) / (hi - lo) * H * 8 + 0.5)
+      }
+      printf "\n  %s%s%s\n", (color ? "\033[1m" : ""), title, (color ? "\033[0m" : "")
+      for (row = H; row >= 1; row--) {
+        lab = (row == H) ? sprintf("%7.1f", hi) : (row == 1 ? sprintf("%7.1f", lo) : "       ")
+        line = ""
+        for (j = 0; j < W; j++) {
+          d = col[j] - (row - 1) * 8
+          line = line (d >= 8 ? blk[8] : (d <= 0 ? " " : blk[d]))
+        }
+        printf "%s %s┤%s%s%s\n", lab, (color ? "\033[2m" : ""), (color ? "\033[0m" c : ""), line, (color ? "\033[0m" : "")
+      }
+      line = ""; for (j = 0; j < W; j++) line = line "─"
+      printf "        %s└%s%s\n", (color ? "\033[2m" : ""), line, (color ? "\033[0m" : "")
+      printf "         0 min%" (W - 5) "s\n", sprintf("%.0f min", m[n - 1])
+    }
+    END {
+      if (n < 2) { print "  (not enough samples to graph)"; exit }
+      split("▁ ▂ ▃ ▄ ▅ ▆ ▇ █", blk, " ")
+      chart("Battery %", y1, 1, "\033[32m")
+      chart("Charging power (W)", y2, 1, "\033[33m")
+      chart("Battery temperature (°C)", y3, 0, "\033[31m")
+    }' "$1"
+}
+
+# Writes a standalone HTML report (SVG graphs) for a decaf CSV to stdout.
+# Args: csv, duration text, note, date text
+html_report() {
+  awk -F, -v T="$2" -v note="$3" -v when="$4" -v ver="$VERSION" '
+    BEGIN { n = 0 }
+    NR > 1 && NF >= 4 { m[n] = $1; y1[n] = $2; y2[n] = $3; y3[n] = $4; n++ }
+    function peak(y,   i, mx) { mx = y[0]; for (i = 1; i < n; i++) if (y[i] > mx) mx = y[i]; return mx }
+    function svg(title, unit, y, zero, c,   W, H, L, Rt, Tp, Bt, pw, ph, i, lo, hi, mx, x, yy, pts, g, v) {
+      W = 640; H = 220; L = 52; Rt = 16; Tp = 12; Bt = 28; pw = W - L - Rt; ph = H - Tp - Bt
+      lo = y[0]; hi = y[0]
+      for (i = 0; i < n; i++) { if (y[i] < lo) lo = y[i]; if (y[i] > hi) hi = y[i] }
+      if (zero) lo = 0
+      if (hi - lo < 1e-9) hi = lo + 1
+      mx = (m[n - 1] > 0) ? m[n - 1] : 1
+      for (i = 0; i < n; i++) {
+        x = L + pw * m[i] / mx; yy = Tp + ph * (1 - (y[i] - lo) / (hi - lo))
+        pts = pts sprintf("%.1f,%.1f ", x, yy)
+      }
+      printf "<section><h2>%s <span>peak %.1f %s</span></h2>\n", title, peak(y), unit
+      printf "<svg viewBox=\"0 0 %d %d\" role=\"img\" aria-label=\"%s\">\n", W, H, title
+      for (g = 0; g <= 2; g++) {
+        v = lo + (hi - lo) * g / 2; yy = Tp + ph * (1 - g / 2)
+        printf "<line class=\"grid\" x1=\"%d\" x2=\"%d\" y1=\"%.1f\" y2=\"%.1f\"/>", L, W - Rt, yy, yy
+        printf "<text class=\"lab\" x=\"%d\" y=\"%.1f\" text-anchor=\"end\">%.1f</text>\n", L - 6, yy + 4, v
+      }
+      printf "<polygon fill=\"%s\" fill-opacity=\"0.15\" points=\"%s%.1f,%.1f %.1f,%.1f\"/>\n", c, pts, L + pw, Tp + ph, L, Tp + ph
+      printf "<polyline fill=\"none\" stroke=\"%s\" stroke-width=\"2\" stroke-linejoin=\"round\" points=\"%s\"/>\n", c, pts
+      printf "<text class=\"lab\" x=\"%d\" y=\"%d\">0 min</text>", L, H - 6
+      printf "<text class=\"lab\" x=\"%d\" y=\"%d\" text-anchor=\"end\">%.0f min</text>\n", W - Rt, H - 6, m[n - 1]
+      print "</svg></section>"
+    }
+    END {
+      rate = (m[n - 1] > 0) ? (y1[n - 1] - y1[0]) / m[n - 1] : 0
+      print "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+      print "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+      printf "<title>Decaf report %s</title>\n", when
+      print "<style>"
+      print ":root{--bg:#fbfaf8;--fg:#2b2320;--mut:#7a6f69;--card:#fff;--line:#e6e0db}"
+      print "@media (prefers-color-scheme:dark){:root{--bg:#1b1715;--fg:#efe8e3;--mut:#a39891;--card:#252120;--line:#3a3431}}"
+      print "body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,system-ui,sans-serif}"
+      print "main{max-width:720px;margin:0 auto;padding:24px 16px 48px}"
+      print "h1{font-size:26px;margin:0 0 4px}.sub{color:var(--mut);margin:0 0 20px}"
+      print ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:20px}"
+      print ".stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}"
+      print ".stat b{display:block;font-size:20px}.stat small{color:var(--mut)}"
+      print "section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:14px}"
+      print "h2{font-size:16px;margin:0 0 6px}h2 span{color:var(--mut);font-weight:400;font-size:13px}"
+      print "svg{width:100%;height:auto;display:block}.grid{stroke:var(--line)}.lab{fill:var(--mut);font-size:11px}"
+      print "footer{color:var(--mut);font-size:12px;text-align:center}"
+      print "</style></head><body><main>"
+      printf "<h1>&#9749; %s%% &rarr; %s%% in %s</h1>\n", y1[0], y1[n - 1], T
+      printf "<p class=\"sub\">%s%s</p>\n", when, note
+      print "<div class=\"stats\">"
+      printf "<div class=\"stat\"><b>%.2f</b><small>%% per minute</small></div>\n", rate
+      printf "<div class=\"stat\"><b>%.1f W</b><small>peak power</small></div>\n", peak(y2)
+      printf "<div class=\"stat\"><b>%.1f &deg;C</b><small>peak temperature</small></div>\n", peak(y3)
+      printf "<div class=\"stat\"><b>%d</b><small>samples</small></div>\n", n
+      print "</div>"
+      svg("Battery", "%", y1, 1, "#2e9e5b")
+      svg("Charging power", "W", y2, 1, "#c98a1b")
+      svg("Battery temperature", "&deg;C", y3, 0, "#d2553f")
+      printf "<footer>Made with decaf %s</footer></main></body></html>\n", ver
+    }' "$1"
+}
+
+samples_in() { awk -F, 'NR > 1 && NF >= 4 { n++ } END { print n + 0 }' "$1"; }
+
+# Prints the summary, both sets of graphs and the file paths for a CSV.
+# Args: csv, duration text, note (e.g. " (stopped early)")
+show_results() {
+  local csv=$1 T=$2 note=$3 html first last when
+  html="${1%.csv}.html"
+  first=$(awk -F, 'NR == 2 { print $2 }' "$csv")
+  last=$(awk -F, 'NR > 1 && NF >= 4 { p = $2 } END { print p }' "$csv")
+  when=$(date -r "$csv" '+%a %e %b %Y, %H:%M' | tr -s ' ')
+  # Write the report first so it exists even if the terminal output is cut off.
+  html_report "$csv" "$T" "$note" "$when" > "$html"
+  echo
+  echo "${B}☕ decaf: ${first}% → ${last}% in ${T}${R}${note}"
+  term_graphs "$csv"
+  echo
+  echo "  ${D}Log:${R}    $csv"
+  echo "  ${D}Report:${R} $html"
+  [ "$open_report" = 1 ] && open "$html" 2>/dev/null
+  LAST_PCT=$last
+}
+
+# --- decaf --report FILE.csv -------------------------------------------------
+if [ -n "$report_csv" ]; then
+  [ -f "$report_csv" ] || die "no such file: $report_csv"
+  [ "$(samples_in "$report_csv")" -ge 2 ] || die "$report_csv has fewer than 2 samples"
+  secs=$(awk -F, 'NR > 1 && NF >= 4 { m = $1 } END { printf "%d", m * 60 + 0.5 }' "$report_csv")
+  show_results "$report_csv" "$(fmt_dur "$secs")" ""
+  exit 0
+fi
+
+# --- live mode ---------------------------------------------------------------
+[ "$(uname)" = Darwin ] || die "decaf only runs on macOS"
+ioreg -rn AppleSmartBattery | grep -q '"Voltage"' || die "no battery found on this Mac"
+
+# Sets pct, state, eta, watts and temp from the battery's current readings.
+sample() {
+  local batt
+  batt=$(pmset -g batt)
+  pct=$(echo "$batt" | grep -o '[0-9]*%' | head -1 | tr -d %)
+  state=$(echo "$batt" | awk -F'; ' 'NR == 2 { print $2 }')
+  eta=$(echo "$batt" | awk -F'; ' 'NR == 2 { split($3, a, " "); if (a[1] ~ /^[0-9]+:[0-9]+$/ && a[1] != "0:00") print a[1] }')
+  # Voltage is in mV, Amperage in mA (a huge number when discharging, since
+  # ioreg shows it unsigned), Temperature in hundredths of a degree C. Newer
+  # macOS versions only report Temperature inside the nested BatteryData
+  # dictionary, so take the first match of each key anywhere in the output.
+  read -r watts temp <<EOF
+$(ioreg -rln AppleSmartBattery | awk '
+  function grab(k,   r) {
+    if (k in val) return
+    if (match($0, "\"" k "\" ?= ?[0-9]+")) { r = substr($0, RSTART, RLENGTH); sub(/.*= ?/, "", r); val[k] = r }
+  }
+  { grab("Voltage"); grab("Amperage"); grab("Temperature") }
+  END {
+    a = val["Amperage"] + 0; if (a > 1e6 || a < 0) a = 0
+    printf "%.1f %.1f\n", val["Voltage"] * a / 1e6, val["Temperature"] / 100
+  }')
+EOF
+}
+
+sample
+if [ "$pct" -ge "$target" ]; then
+  echo "decaf: battery is already at ${pct}% (target ${target}%). Nothing to time."
+  exit 0
+fi
+
+mkdir -p "$outdir" || die "can't create $outdir"
+log="$outdir/decaf_$(date +%Y%m%d_%H%M%S).csv"
+echo "min,pct,watts,tempC" > "$log"
+
+# Keep the Mac awake for as long as decaf runs.
+caffeinate -i -w $$ 2>/dev/null &
+
+stop=""
+trap 'stop=1' INT TERM
+live=0
+[ "$tty" = 1 ] && [ "$quiet" = 0 ] && live=1
+[ "$live" = 1 ] && printf '\033[?25l' # hide the cursor while the live line redraws
+trap '[ "$live" = 1 ] && printf "\033[?25h"' EXIT
+
+start=$(date +%s)
+start_pct=$pct
+next=0
+reached=""
+
+while :; do
+  el=$(( $(date +%s) - start ))
+  if [ "$el" -ge "$next" ]; then
+    [ "$next" -gt 0 ] && sample
+    awk -v s="$el" -v p="$pct" -v w="$watts" -v t="$temp" \
+      'BEGIN { printf "%.1f,%s,%s,%s\n", s / 60, p, w, t }' >> "$log"
+    next=$(( next + interval ))
+    if [ "$pct" -ge "$target" ]; then reached=1; break; fi
+  fi
+  [ -n "$stop" ] && break
+
+  if [ "$live" = 1 ]; then
+    span=$(( target - start_pct )); [ "$span" -lt 1 ] && span=1
+    filled=$(( (pct - start_pct) * 20 / span ))
+    [ "$filled" -lt 0 ] && filled=0; [ "$filled" -gt 20 ] && filled=20
+    bar=$(printf '%*s' "$filled" '' | tr ' ' '#')$(printf '%*s' $(( 20 - filled )) '' | tr ' ' '.')
+    case "$state" in
+      discharging) st="on battery: plug in the charger" ;;
+      *)           st="$state${eta:+, ~$eta left}" ;;
+    esac
+    printf '\r\033[K☕ %s%3s%%%s [%s] → %s%%  %s W  %s °C  %s  %s(%s)%s' \
+      "$B" "$pct" "$R" "$bar" "$target" "$watts" "$temp" "$(fmt_dur "$el")" "$D" "$st" "$R"
+  fi
+  sleep 1
+  [ -n "$stop" ] && break
+done
+
+[ "$live" = 1 ] && printf '\r\033[K'
+el=$(( $(date +%s) - start ))
+T=$(fmt_dur "$el")
+note=""
+[ -z "$reached" ] && note=" (stopped early, target was ${target}%)"
+
+if [ "$(samples_in "$log")" -lt 2 ]; then
+  echo "decaf: stopped after ${T}, too soon to graph anything."
+  echo "  Log: $log"
+  exit 0
+fi
+
+show_results "$log" "$T" "$note"
+if [ "$notify" = 1 ]; then
+  if [ -n "$reached" ]; then msg="Reached ${LAST_PCT}% in $T"; else msg="Stopped at ${LAST_PCT}% after $T"; fi
+  osascript -e "display notification \"$msg\" with title \"☕ Decaf\"" 2>/dev/null
+fi
+exit 0
